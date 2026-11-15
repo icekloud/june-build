@@ -1,0 +1,107 @@
+name: build
+
+# Manual build of the June Android app (io.element.android.june).
+# Source lives in a separate private repository; nothing from it is printed or kept here.
+# Outputs (APK and the full build log) are encrypted for the maintainer before upload.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Source commit SHA (40 hex)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  AGE_RECIPIENT: age1d65p0upyycrevqzlj6ezvnrn9sd7wcznaxyjdr7wfl4k8ysl9sesuk78pg
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+        with:
+          tool-cache: true
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: Use JDK 21
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Fetch source
+        env:
+          DEPLOY_KEY: ${{ secrets.PRIVATE_SRC_DEPLOY_KEY }}
+          SRC_REPO: ${{ secrets.SRC_REPO }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set -eu
+          echo "$REF" | grep -Eq '^[0-9a-f]{40}$' || { echo "ref must be a 40-hex commit SHA"; exit 1; }
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/src_key; chmod 600 ~/.ssh/src_key
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/src_key -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
+          mkdir src; cd src
+          git init -q
+          git fetch -q --depth 1 "git@github.com:${SRC_REPO}.git" "$REF" >/dev/null 2>&1 || { echo "fetch failed"; exit 1; }
+          git checkout -q FETCH_HEAD >/dev/null 2>&1
+          rm -f ~/.ssh/src_key
+          echo "source ready"
+
+      - name: Build (output kept only in the encrypted log)
+        working-directory: src
+        env:
+          JUNE_KEYSTORE_B64: ${{ secrets.JUNE_KEYSTORE_B64 }}
+          JUNE_STORE_PASSWORD: ${{ secrets.JUNE_STORE_PASSWORD }}
+          JUNE_KEY_ALIAS: ${{ secrets.JUNE_KEY_ALIAS }}
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+          JUNE_PUSH_GATEWAY_URL: ${{ secrets.JUNE_PUSH_GATEWAY_URL }}
+          ELEMENT_ANDROID_MAPTILER_API_KEY: ${{ secrets.MAPTILER_KEY }}
+          GRADLE_OPTS: -Dorg.gradle.jvmargs=-Xmx8g -XX:MaxMetaspaceSize=512m -Dfile.encoding=UTF-8 -XX:+UseG1GC -Dkotlin.daemon.jvm.options=-Xmx4g
+        run: |
+          set +e
+          START=$(date +%s)
+          OUT="$RUNNER_TEMP/out"; mkdir -p "$OUT"
+          LOG="$RUNNER_TEMP/build.log"
+          {
+            echo "$JUNE_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/june.p12"
+            python3 .github/june/write_firebase_xml.py
+            JUNE_KEYSTORE_FILE="$RUNNER_TEMP/june.p12" ./gradlew :app:assembleGplayRelease -PjuneAbi=arm64-v8a --no-configuration-cache --console=plain
+          } > "$LOG" 2>&1
+          RC=$?
+          rm -f "$RUNNER_TEMP/june.p12"
+          sudo apt-get install -y -qq age >/dev/null 2>&1
+          age -r "$AGE_RECIPIENT" -o "$OUT/build.log.age" "$LOG"
+          APK=app/build/outputs/apk/gplay/release/app-gplay-arm64-v8a-release.apk
+          if [ "$RC" -eq 0 ] && [ -f "$APK" ]; then
+            age -r "$AGE_RECIPIENT" -o "$OUT/app.apk.age" "$APK"
+          fi
+          rm -f "$LOG"
+          echo "result: $([ "$RC" -eq 0 ] && echo success || echo failure)  minutes: $(( ($(date +%s) - START) / 60 ))"
+          echo "RC=$RC" >> "$GITHUB_ENV"
+
+      - name: Upload encrypted outputs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: out
+          path: ${{ runner.temp }}/out/
+          retention-days: 1
+          if-no-files-found: ignore
+
+      - name: Status
+        run: test "${RC:-1}" = "0"
