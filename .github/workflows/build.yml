@@ -2,7 +2,8 @@ name: build
 
 # Manual build of the June Android app (io.element.android.june).
 # Source lives in a separate private repository; nothing from it is printed or kept here.
-# Outputs (APK and the full build log) are encrypted for the maintainer before upload.
+# Outputs (APK, unit test results and the full logs) are encrypted for the maintainer before upload.
+# The public log shows only pass/fail and counts.
 
 on:
   workflow_dispatch:
@@ -10,6 +11,10 @@ on:
       ref:
         description: "Source commit SHA (40 hex)"
         required: true
+      tests:
+        description: "auto = unit tests of modules changed by the commit (vs first parent), none = skip, or Gradle test tasks separated by spaces"
+        required: false
+        default: "auto"
 
 permissions:
   contents: read
@@ -20,11 +25,12 @@ concurrency:
 
 env:
   AGE_RECIPIENT: age1d65p0upyycrevqzlj6ezvnrn9sd7wcznaxyjdr7wfl4k8ysl9sesuk78pg
+  GRADLE_OPTS: -Dorg.gradle.jvmargs=-Xmx8g -XX:MaxMetaspaceSize=512m -Dfile.encoding=UTF-8 -XX:+UseG1GC -Dkotlin.daemon.jvm.options=-Xmx4g
 
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 150
     steps:
       - name: Free disk space
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
@@ -43,6 +49,9 @@ jobs:
           distribution: temurin
           java-version: '21'
 
+      - name: Install age
+        run: sudo apt-get install -y -qq age >/dev/null 2>&1
+
       - name: Fetch source
         env:
           DEPLOY_KEY: ${{ secrets.PRIVATE_SRC_DEPLOY_KEY }}
@@ -57,10 +66,90 @@ jobs:
           export GIT_SSH_COMMAND="ssh -i ~/.ssh/src_key -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
           mkdir src; cd src
           git init -q
-          git fetch -q --depth 1 "git@github.com:${SRC_REPO}.git" "$REF" >/dev/null 2>&1 || { echo "fetch failed"; exit 1; }
+          # depth 2: the commit and its parents, so the change set can be computed for unit tests
+          git fetch -q --depth 2 "git@github.com:${SRC_REPO}.git" "$REF" >/dev/null 2>&1 || { echo "fetch failed"; exit 1; }
           GIT_LFS_SKIP_SMUDGE=1 git -c filter.lfs.smudge= -c filter.lfs.process= -c filter.lfs.required=false checkout -q FETCH_HEAD >/dev/null 2>&1 || { echo "checkout failed"; exit 1; }
           rm -f ~/.ssh/src_key
+          mkdir -p "$RUNNER_TEMP/out"
           echo "source ready"
+
+      - name: Unit tests (output kept only in the encrypted log)
+        working-directory: src
+        env:
+          TESTS: ${{ inputs.tests }}
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+          JUNE_PUSH_GATEWAY_URL: ${{ secrets.JUNE_PUSH_GATEWAY_URL }}
+          ELEMENT_ANDROID_MAPTILER_API_KEY: ${{ secrets.MAPTILER_KEY }}
+          JUNE_VOICE_SHORTCUT_ROOM_ID: ${{ secrets.JUNE_VOICE_SHORTCUT_ROOM_ID }}
+        run: |
+          set +e
+          START=$(date +%s)
+          OUT="$RUNNER_TEMP/out"
+          TLOG="$RUNNER_TEMP/test.log"
+          MODE="${TESTS:-auto}"
+          if [ "$MODE" = "none" ]; then
+            echo "tests: skipped"; echo "TRC=0" >> "$GITHUB_ENV"; exit 0
+          fi
+          if [ "$MODE" = "auto" ]; then
+            TASKS=$(python3 - <<'PY'
+          import os, re, subprocess
+          r = subprocess.run(["git", "diff", "--name-only", "HEAD^1", "HEAD"], capture_output=True, text=True)
+          tasks = set()
+          for f in r.stdout.split():
+              d = os.path.dirname(f)
+              while d and not os.path.isfile(os.path.join(d, "build.gradle.kts")):
+                  d = os.path.dirname(d)
+              if not d:
+                  continue
+              b = open(os.path.join(d, "build.gradle.kts"), encoding="utf-8").read()
+              if "io.element.android-compose-application" in b:
+                  t = "testGplayDebugUnitTest"
+              elif "io.element.jvm-library" in b:
+                  t = "test"
+              elif re.search(r"io\.element\.android(-compose)?-library", b):
+                  t = "testDebugUnitTest"
+              else:
+                  continue
+              tasks.add(":" + d.replace("/", ":") + ":" + t)
+          print(" ".join(sorted(tasks)))
+          PY
+            )
+          else
+            TASKS="$MODE"
+          fi
+          for t in $TASKS; do
+            echo "$t" | grep -Eq '^(:[A-Za-z0-9_-]+)+:[A-Za-z]+$' || { echo "invalid test task"; echo "TRC=1" >> "$GITHUB_ENV"; exit 0; }
+          done
+          N=$(echo $TASKS | wc -w)
+          if [ "$N" -eq 0 ]; then
+            echo "tests: no changed module with unit tests"; echo "TRC=0" >> "$GITHUB_ENV"; exit 0
+          fi
+          {
+            echo "tasks: $TASKS"
+            python3 .github/june/write_firebase_xml.py
+            ./gradlew $TASKS --continue --no-configuration-cache --console=plain
+          } > "$TLOG" 2>&1
+          TRC=$?
+          ./gradlew --stop >/dev/null 2>&1
+          find . -path '*/build/test-results/*' -name '*.xml' > "$RUNNER_TEMP/results.lst"
+          tar czf "$RUNNER_TEMP/test-results.tgz" -T "$RUNNER_TEMP/results.lst" 2>/dev/null
+          age -r "$AGE_RECIPIENT" -o "$OUT/test.log.age" "$TLOG"
+          age -r "$AGE_RECIPIENT" -o "$OUT/test-results.tgz.age" "$RUNNER_TEMP/test-results.tgz"
+          COUNTS=$(python3 - "$RUNNER_TEMP/results.lst" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          t = f = e = s = 0
+          for p in open(sys.argv[1]).read().split():
+              try:
+                  r = ET.parse(p).getroot()
+              except Exception:
+                  continue
+              t += int(r.get("tests", 0)); f += int(r.get("failures", 0)); e += int(r.get("errors", 0)); s += int(r.get("skipped", 0))
+          print(f"tests {t}, failed {f + e}, skipped {s}")
+          PY
+          )
+          rm -f "$TLOG" "$RUNNER_TEMP/test-results.tgz" "$RUNNER_TEMP/results.lst"
+          echo "tests: $([ "$TRC" -eq 0 ] && echo success || echo failure)  tasks: $N  $COUNTS  minutes: $(( ($(date +%s) - START) / 60 ))"
+          echo "TRC=$TRC" >> "$GITHUB_ENV"
 
       - name: Build (output kept only in the encrypted log)
         working-directory: src
@@ -72,11 +161,10 @@ jobs:
           JUNE_PUSH_GATEWAY_URL: ${{ secrets.JUNE_PUSH_GATEWAY_URL }}
           ELEMENT_ANDROID_MAPTILER_API_KEY: ${{ secrets.MAPTILER_KEY }}
           JUNE_VOICE_SHORTCUT_ROOM_ID: ${{ secrets.JUNE_VOICE_SHORTCUT_ROOM_ID }}
-          GRADLE_OPTS: -Dorg.gradle.jvmargs=-Xmx8g -XX:MaxMetaspaceSize=512m -Dfile.encoding=UTF-8 -XX:+UseG1GC -Dkotlin.daemon.jvm.options=-Xmx4g
         run: |
           set +e
           START=$(date +%s)
-          OUT="$RUNNER_TEMP/out"; mkdir -p "$OUT"
+          OUT="$RUNNER_TEMP/out"
           LOG="$RUNNER_TEMP/build.log"
           {
             echo "$JUNE_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/june.p12"
@@ -85,7 +173,6 @@ jobs:
           } > "$LOG" 2>&1
           RC=$?
           rm -f "$RUNNER_TEMP/june.p12"
-          sudo apt-get install -y -qq age >/dev/null 2>&1
           age -r "$AGE_RECIPIENT" -o "$OUT/build.log.age" "$LOG"
           APK=app/build/outputs/apk/gplay/release/app-gplay-arm64-v8a-release.apk
           if [ "$RC" -eq 0 ] && [ -f "$APK" ]; then
@@ -105,4 +192,6 @@ jobs:
           if-no-files-found: ignore
 
       - name: Status
-        run: test "${RC:-1}" = "0"
+        run: |
+          echo "build RC=${RC:-1}  tests TRC=${TRC:-1}"
+          test "${RC:-1}" = "0" && test "${TRC:-1}" = "0"
