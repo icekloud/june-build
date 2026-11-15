@@ -58,7 +58,7 @@ jobs:
           mkdir src; cd src
           git init -q
           git fetch -q --depth 1 "git@github.com:${SRC_REPO}.git" "$REF" >/dev/null 2>&1 || { echo "fetch failed"; exit 1; }
-          git checkout -q FETCH_HEAD >/dev/null 2>&1
+          GIT_LFS_SKIP_SMUDGE=1 git -c filter.lfs.smudge= -c filter.lfs.process= -c filter.lfs.required=false checkout -q FETCH_HEAD >/dev/null 2>&1 || { echo "checkout failed"; exit 1; }
           rm -f ~/.ssh/src_key
           echo "source ready"
 
