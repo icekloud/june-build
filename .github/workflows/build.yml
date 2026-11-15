@@ -71,6 +71,7 @@ jobs:
           GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
           JUNE_PUSH_GATEWAY_URL: ${{ secrets.JUNE_PUSH_GATEWAY_URL }}
           ELEMENT_ANDROID_MAPTILER_API_KEY: ${{ secrets.MAPTILER_KEY }}
+          JUNE_VOICE_SHORTCUT_ROOM_ID: ${{ secrets.JUNE_VOICE_SHORTCUT_ROOM_ID }}
           GRADLE_OPTS: -Dorg.gradle.jvmargs=-Xmx8g -XX:MaxMetaspaceSize=512m -Dfile.encoding=UTF-8 -XX:+UseG1GC -Dkotlin.daemon.jvm.options=-Xmx4g
         run: |
           set +e
