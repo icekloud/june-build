@@ -15,6 +15,22 @@ on:
         description: "auto = unit tests of modules changed by the commit (vs first parent), none = skip, or Gradle test tasks separated by spaces"
         required: false
         default: "auto"
+      swap_gb:
+        description: "Total swap in GB before the build (0 = leave the runner's swap as it is)"
+        required: false
+        default: "8"
+      memlog:
+        description: "1 = log memory every 30 s to the public log (numbers only), 0 = off"
+        required: false
+        default: "1"
+      gradle_xmx:
+        description: "Gradle daemon heap (-Xmx), e.g. 6g; 8g was the value before PUB-69"
+        required: false
+        default: "6g"
+      kotlin_xmx:
+        description: "Kotlin daemon heap (-Xmx), e.g. 3g; 4g was the value before PUB-69"
+        required: false
+        default: "3g"
 
 permissions:
   contents: read
@@ -25,7 +41,13 @@ concurrency:
 
 env:
   AGE_RECIPIENT: age1d65p0upyycrevqzlj6ezvnrn9sd7wcznaxyjdr7wfl4k8ysl9sesuk78pg
-  GRADLE_OPTS: -Dorg.gradle.jvmargs=-Xmx8g -XX:MaxMetaspaceSize=512m -Dfile.encoding=UTF-8 -XX:+UseG1GC -Dkotlin.daemon.jvm.options=-Xmx4g
+  # PUB-69: 16 GB runner. Gradle 6g + metaspace and Kotlin 3g leave room for the OS, the runner and test JVMs;
+  # workers.max 4 = the runner's cores (the source repo does not set it). Values are checked in "Memory setup".
+  JUNE_BUILD_SWAP_GB: ${{ inputs.swap_gb || '8' }}
+  JUNE_BUILD_MEMLOG: ${{ inputs.memlog || '1' }}
+  JUNE_BUILD_GRADLE_XMX: ${{ inputs.gradle_xmx || '6g' }}
+  JUNE_BUILD_KOTLIN_XMX: ${{ inputs.kotlin_xmx || '3g' }}
+  GRADLE_OPTS: -Dorg.gradle.jvmargs=-Xmx${{ inputs.gradle_xmx || '6g' }} -XX:MaxMetaspaceSize=512m -Dfile.encoding=UTF-8 -XX:+UseG1GC -Dkotlin.daemon.jvm.options=-Xmx${{ inputs.kotlin_xmx || '3g' }} -Dorg.gradle.workers.max=4
 
 jobs:
   build:
@@ -51,6 +73,56 @@ jobs:
 
       - name: Install age
         run: sudo apt-get install -y -qq age >/dev/null 2>&1
+
+      # PUB-69: memwatch.sh sits next to this file in the public repository (only that file is checked out)
+      - name: Get memory watcher
+        if: env.JUNE_BUILD_MEMLOG != '0'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: june-build-ops
+          sparse-checkout: .github/workflows/memwatch.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      # Public log: only numbers (swap size, heap sizes).
+      - name: Memory setup
+        run: |
+          set -eu
+          echo "$JUNE_BUILD_GRADLE_XMX" | grep -Eq '^[0-9]{1,2}[gG]$|^[0-9]{3,5}[mM]$' || { echo "gradle_xmx must look like 6g"; exit 1; }
+          echo "$JUNE_BUILD_KOTLIN_XMX" | grep -Eq '^[0-9]{1,2}[gG]$|^[0-9]{3,5}[mM]$' || { echo "kotlin_xmx must look like 3g"; exit 1; }
+          echo "$JUNE_BUILD_SWAP_GB" | grep -Eq '^[0-9]{1,2}$' || { echo "swap_gb must be 0-99"; exit 1; }
+          echo "$JUNE_BUILD_MEMLOG" | grep -Eq '^[01]$' || { echo "memlog must be 0 or 1"; exit 1; }
+          echo "heap: gradle $JUNE_BUILD_GRADLE_XMX  kotlin $JUNE_BUILD_KOTLIN_XMX  workers 4"
+          have_mb() { awk '/^SwapTotal:/ {print int($2 / 1024)}' /proc/meminfo; }
+          WANT=$(( JUNE_BUILD_SWAP_GB * 1024 ))
+          HAVE=$(have_mb)
+          if [ "$WANT" -eq 0 ] || [ "$HAVE" -ge "$WANT" ]; then
+            echo "swap: kept  total_mb $HAVE"
+          else
+            # add one file for the missing part so the total reaches the target (the runner's own swap stays)
+            F=/mnt/june-swap; [ -d /mnt ] || F=/june-swap
+            ADD=$(( WANT - HAVE ))
+            if { sudo fallocate -l "${ADD}M" "$F" || sudo dd if=/dev/zero of="$F" bs=1M count="$ADD" status=none; } >/dev/null 2>&1 \
+              && sudo chmod 600 "$F" && sudo mkswap "$F" >/dev/null 2>&1 && sudo swapon "$F" >/dev/null 2>&1; then
+              echo "swap: added_mb $ADD  total_mb $(have_mb)"
+            else
+              echo "swap: could not add, total_mb $(have_mb)"
+            fi
+          fi
+          echo "mem: total_mb $(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)  available_mb $(awk '/^MemAvailable:/ {print int($2 / 1024)}' /proc/meminfo)  cpus $(nproc)"
+
+      # Lines are numbers only (see memwatch.sh) and also stream live in the Build step.
+      - name: Start memory log
+        if: env.JUNE_BUILD_MEMLOG != '0'
+        run: |
+          if [ -f june-build-ops/.github/workflows/memwatch.sh ]; then
+            cp june-build-ops/.github/workflows/memwatch.sh "$RUNNER_TEMP/memwatch.sh"
+            nohup bash "$RUNNER_TEMP/memwatch.sh" 30 > "$RUNNER_TEMP/mem.log" 2>/dev/null < /dev/null &
+            echo "$!" > "$RUNNER_TEMP/memwatch.pid"
+            echo "memlog: on, every 30 s"
+          else
+            echo "memlog: watcher missing, off"
+          fi
 
       - name: Fetch source
         env:
@@ -151,7 +223,14 @@ jobs:
           echo "tests: $([ "$TRC" -eq 0 ] && echo success || echo failure)  tasks: $N  $COUNTS  minutes: $(( ($(date +%s) - START) / 60 ))"
           echo "TRC=$TRC" >> "$GITHUB_ENV"
 
+      - name: Memory log after unit tests (numbers only)
+        if: always() && env.JUNE_BUILD_MEMLOG != '0'
+        run: |
+          tail -n 40 "$RUNNER_TEMP/mem.log" 2>/dev/null | grep -E '^mem [0-9:]+( [a-z0-9_]+=[0-9.]+)+$' || echo "memlog: empty"
+
+      # PUB-69: a normal build takes 11-25 min; a stuck one (PUB-68, 51+ min) stops here instead of using the job's 150 min.
       - name: Build (output kept only in the encrypted log)
+        timeout-minutes: 45
         working-directory: src
         env:
           JUNE_KEYSTORE_B64: ${{ secrets.JUNE_KEYSTORE_B64 }}
@@ -166,6 +245,12 @@ jobs:
           START=$(date +%s)
           OUT="$RUNNER_TEMP/out"
           LOG="$RUNNER_TEMP/build.log"
+          # PUB-69: stream memory lines live, so they reach the public log even if the runner is lost
+          TAIL_PID=
+          if [ -f "$RUNNER_TEMP/mem.log" ]; then
+            tail -n 0 -F --pid=$$ "$RUNNER_TEMP/mem.log" 2>/dev/null &
+            TAIL_PID=$!
+          fi
           {
             echo "$JUNE_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/june.p12"
             python3 .github/june/write_firebase_xml.py
@@ -179,8 +264,28 @@ jobs:
             age -r "$AGE_RECIPIENT" -o "$OUT/app.apk.age" "$APK"
           fi
           rm -f "$LOG"
+          [ -n "$TAIL_PID" ] && kill "$TAIL_PID" 2>/dev/null
           echo "result: $([ "$RC" -eq 0 ] && echo success || echo failure)  minutes: $(( ($(date +%s) - START) / 60 ))"
           echo "RC=$RC" >> "$GITHUB_ENV"
+
+      # PUB-69: after a timeout the Build step never encrypted its log; keep the partial log (encrypted) and drop the keystore.
+      - name: Keep partial build log
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/june.p12"
+          if [ -f "$RUNNER_TEMP/build.log" ]; then
+            mkdir -p "$RUNNER_TEMP/out"
+            age -r "$AGE_RECIPIENT" -o "$RUNNER_TEMP/out/build.log.age" "$RUNNER_TEMP/build.log" >/dev/null 2>&1 \
+              && echo "partial build log: kept encrypted" || echo "partial build log: not kept"
+            rm -f "$RUNNER_TEMP/build.log"
+          fi
+
+      - name: Memory log after build (numbers only)
+        if: always() && env.JUNE_BUILD_MEMLOG != '0'
+        run: |
+          tail -n 40 "$RUNNER_TEMP/mem.log" 2>/dev/null | grep -E '^mem [0-9:]+( [a-z0-9_]+=[0-9.]+)+$' || echo "memlog: empty"
+          [ -f "$RUNNER_TEMP/memwatch.pid" ] && kill "$(cat "$RUNNER_TEMP/memwatch.pid")" 2>/dev/null
+          true
 
       - name: Upload encrypted outputs
         if: always()
