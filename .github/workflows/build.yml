@@ -1,4 +1,6 @@
 name: build
+# PUB-248: the caller's tag in the run name, so a caller finds its own run (display_title), not the newest one
+run-name: build ${{ inputs.tag }}
 
 # Manual build of the June Android app (io.element.android.june).
 # Source lives in a separate private repository; nothing from it is printed or kept here.
@@ -35,6 +37,10 @@ on:
         description: "APK ABI: arm64-v8a (phones, default) or x86_64 (android-lab emulator for Maestro QA)"
         required: false
         default: "arm64-v8a"
+      tag:
+        description: "Caller's run tag shown in the run name (letters, digits and -, 64 at most; empty = none)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -58,6 +64,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     steps:
+      # PUB-248: checked before anything else; the tag reaches bash only through env
+      - name: Check tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          [[ "$TAG" =~ ^[A-Za-z0-9-]{0,64}$ ]] || { echo "tag must be letters, digits and - (64 at most)"; exit 1; }
+          echo "tag: ${TAG:-none}"
+
       - name: Free disk space
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
         with:
