@@ -12,7 +12,7 @@ on:
         description: "Source commit SHA (40 hex)"
         required: true
       tests:
-        description: "auto = unit tests of modules changed by the commit (vs first parent), none = skip, or Gradle test tasks separated by spaces"
+        description: "auto = unit tests of modules changed by the PR (merge-base with june-main; june-main commits: vs first parent) + screenshot tests if screen code changed, none = skip, or Gradle test tasks separated by spaces"
         required: false
         default: "auto"
       swap_gb:
@@ -145,6 +145,17 @@ jobs:
           # depth 2: the commit and its parents, so the change set can be computed for unit tests
           git fetch -q --depth 2 "git@github.com:${SRC_REPO}.git" "$REF" >/dev/null 2>&1 || { echo "fetch failed"; exit 1; }
           GIT_LFS_SKIP_SMUDGE=1 git -c filter.lfs.smudge= -c filter.lfs.process= -c filter.lfs.required=false checkout -q FETCH_HEAD >/dev/null 2>&1 || { echo "checkout failed"; exit 1; }
+          # PUB-215: june-main and enough history for the merge-base, so tests: auto sees the whole PR.
+          # Not found = the unit test step falls back to HEAD^1 and says so; the build itself goes on.
+          SRC="git@github.com:${SRC_REPO}.git"
+          MAIN="+refs/heads/june-main:refs/remotes/origin/june-main"
+          if git fetch -q --depth 50 "$SRC" "$MAIN" >/dev/null 2>&1; then
+            for d in 50 300 1000; do
+              git merge-base HEAD refs/remotes/origin/june-main >/dev/null 2>&1 && break
+              git fetch -q --deepen "$d" "$SRC" "$REF" "$MAIN" >/dev/null 2>&1 || break
+            done
+          fi
+          git merge-base HEAD refs/remotes/origin/june-main >/dev/null 2>&1 && echo "merge-base: found" || echo "merge-base: not found"
           rm -f ~/.ssh/src_key
           mkdir -p "$RUNNER_TEMP/out"
           echo "source ready"
@@ -166,30 +177,88 @@ jobs:
           if [ "$MODE" = "none" ]; then
             echo "tests: skipped"; echo "TRC=0" >> "$GITHUB_ENV"; exit 0
           fi
+          WHY=
           if [ "$MODE" = "auto" ]; then
-            TASKS=$(python3 - <<'PY'
+            SEL=$(python3 - <<'PY'
+          # PUB-215: one place for the auto rule; tests/june-build/test_select_tests.py runs these functions
           import os, re, subprocess
-          r = subprocess.run(["git", "diff", "--name-only", "HEAD^1", "HEAD"], capture_output=True, text=True)
-          tasks = set()
-          for f in r.stdout.split():
+
+          BASE = "refs/remotes/origin/june-main"  # fetched by "Fetch source"
+          UITESTS = ":tests:uitests:testDebugUnitTest"
+          UI_PLUGINS = ("io.element.android-compose-library", "io.element.android-compose-application")
+          UI_DIRS = ("libraries/designsystem/",)
+
+
+          def git(*args):
+              r = subprocess.run(["git", *args], capture_output=True, text=True)
+              return r.returncode, r.stdout.strip()
+
+
+          def changed_files():
+              """(files, scope): the whole PR (merge-base with june-main..HEAD), or HEAD^1..HEAD for a june-main commit."""
+              rc, mb = git("merge-base", "HEAD", BASE)
+              _, head = git("rev-parse", "HEAD")
+              if rc == 0 and mb and mb != head:
+                  frm, scope = mb, "pr"
+              else:
+                  frm, scope = "HEAD^1", "last" if rc == 0 and mb else "fallback"
+              _, out = git("diff", "--name-only", "--no-renames", frm, "HEAD")
+              return out.split(), scope
+
+
+          def module_of(f):
               d = os.path.dirname(f)
               while d and not os.path.isfile(os.path.join(d, "build.gradle.kts")):
                   d = os.path.dirname(d)
-              if not d:
-                  continue
-              b = open(os.path.join(d, "build.gradle.kts"), encoding="utf-8").read()
-              if "io.element.android-compose-application" in b:
-                  t = "testGplayDebugUnitTest"
-              elif "io.element.jvm-library" in b:
-                  t = "test"
-              elif re.search(r"io\.element\.android(-compose)?-library", b):
-                  t = "testDebugUnitTest"
-              else:
-                  continue
-              tasks.add(":" + d.replace("/", ":") + ":" + t)
-          print(" ".join(sorted(tasks)))
+              return d
+
+
+          def select(files):
+              """(sorted Gradle test tasks, ui): ui = a screen module's src/main or the design system changed."""
+              tasks, ui = set(), False
+              for f in files:
+                  if f.startswith(UI_DIRS):
+                      ui = True
+                  d = module_of(f)
+                  if not d:
+                      continue
+                  with open(os.path.join(d, "build.gradle.kts"), encoding="utf-8") as fh:
+                      b = fh.read()
+                  if any(p in b for p in UI_PLUGINS) and f.startswith(d + "/src/main/"):
+                      ui = True
+                  if "io.element.android-compose-application" in b:
+                      t = "testGplayDebugUnitTest"
+                  elif "io.element.jvm-library" in b:
+                      t = "test"
+                  elif re.search(r"io\.element\.android(-compose)?-library", b):
+                      t = "testDebugUnitTest"
+                  else:
+                      continue
+                  tasks.add(":" + d.replace("/", ":") + ":" + t)
+              if ui and os.path.isfile("tests/uitests/build.gradle.kts"):
+                  tasks.add(UITESTS)
+              return sorted(tasks), ui
+
+
+          def reason(n, scope, uitests):
+              where = {"pr": "PR 범위", "last": "마지막 커밋", "fallback": "마지막 커밋(merge-base 못 구함)"}[scope]
+              return f"auto: {where} {n}파일" + (", 화면 시험 포함" if uitests else "")
+
+
+          def main():
+              files, scope = changed_files()
+              tasks, ui = select(files)
+              print(" ".join(tasks))
+              print(reason(len(files), scope, UITESTS in tasks))
+
+
+          if __name__ == "__main__":
+              main()
           PY
             )
+            TASKS=$(echo "$SEL" | sed -n 1p)
+            WHY=$(echo "$SEL" | sed -n 2p)
+            echo "tests: $WHY"
           else
             TASKS="$MODE"
           fi
@@ -201,7 +270,7 @@ jobs:
             echo "tests: no changed module with unit tests"; echo "TRC=0" >> "$GITHUB_ENV"; exit 0
           fi
           {
-            echo "tasks: $TASKS"
+            echo "tasks: $TASKS${WHY:+  ($WHY)}"
             python3 .github/june/write_firebase_xml.py
             ./gradlew $TASKS --continue --no-configuration-cache --console=plain
           } > "$TLOG" 2>&1
