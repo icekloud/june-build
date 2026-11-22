@@ -174,6 +174,20 @@ jobs:
           mkdir -p "$RUNNER_TEMP/out"
           echo "source ready"
 
+      # PUB-333: public library downloads only (modules-2 files + their metadata). Never transforms-*, build-cache-*,
+      # jars-*, the wrapper, the source, ~/.ssh or $RUNNER_TEMP (no setup-gradle: it would also keep compiled app code).
+      # Key = OS + hash of the fetched source's build files (src/ under the workspace, so hashFiles sees them).
+      - name: Restore dependency cache
+        id: depcache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/caches/modules-2/files-2.1
+            ~/.gradle/caches/modules-2/metadata-*
+          key: ${{ runner.os }}-gradle-modules-${{ hashFiles('src/gradle/libs.versions.toml', 'src/gradle/wrapper/gradle-wrapper.properties', 'src/**/*.gradle.kts') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-modules-
+
       - name: Unit tests (output kept only in the encrypted log)
         working-directory: src
         env:
@@ -289,6 +303,19 @@ jobs:
             ./gradlew $TASKS --continue --no-configuration-cache --console=plain
           } > "$TLOG" 2>&1
           TRC=$?
+          # PUB-333: Maven Central 429 -> wait 60-120 s, run the same Gradle command once more (public log: one fixed line)
+          RETRY429=0
+          if [ "$TRC" -ne 0 ] && grep -qF 'status code 429' "$TLOG" 2>/dev/null; then
+            RETRY429=1
+            echo "429 감지, 1회 재시도"
+            WAIT429=${JUNE_BUILD_429_WAIT:-$(( 60 + RANDOM % 61 ))}
+            sleep "$WAIT429"
+            {
+              echo "retry429: 1 (status code 429, waited ${WAIT429}s, same Gradle command once more)"
+              ./gradlew $TASKS --continue --no-configuration-cache --console=plain
+            } >> "$TLOG" 2>&1
+            TRC=$?
+          fi
           ./gradlew --stop >/dev/null 2>&1
           find . -path '*/build/test-results/*' -name '*.xml' > "$RUNNER_TEMP/results.lst"
           tar czf "$RUNNER_TEMP/test-results.tgz" -T "$RUNNER_TEMP/results.lst" 2>/dev/null
@@ -308,6 +335,7 @@ jobs:
           )
           rm -f "$TLOG" "$RUNNER_TEMP/test-results.tgz" "$RUNNER_TEMP/results.lst"
           echo "tests: $([ "$TRC" -eq 0 ] && echo success || echo failure)  tasks: $N  $COUNTS  minutes: $(( ($(date +%s) - START) / 60 ))"
+          echo "retry429: $RETRY429"
           echo "TRC=$TRC" >> "$GITHUB_ENV"
 
       - name: Memory log after unit tests (numbers only)
@@ -346,6 +374,19 @@ jobs:
             JUNE_KEYSTORE_FILE="$RUNNER_TEMP/june.p12" ./gradlew :app:assembleGplayRelease -PjuneAbi="$JUNE_ABI" --no-configuration-cache --console=plain
           } > "$LOG" 2>&1
           RC=$?
+          # PUB-333: Maven Central 429 -> wait 60-120 s, run the same Gradle command once more (public log: one fixed line)
+          RETRY429=0
+          if [ "$RC" -ne 0 ] && grep -qF 'status code 429' "$LOG" 2>/dev/null; then
+            RETRY429=1
+            echo "429 감지, 1회 재시도"
+            WAIT429=${JUNE_BUILD_429_WAIT:-$(( 60 + RANDOM % 61 ))}
+            sleep "$WAIT429"
+            {
+              echo "retry429: 1 (status code 429, waited ${WAIT429}s, same Gradle command once more)"
+              JUNE_KEYSTORE_FILE="$RUNNER_TEMP/june.p12" ./gradlew :app:assembleGplayRelease -PjuneAbi="$JUNE_ABI" --no-configuration-cache --console=plain
+            } >> "$LOG" 2>&1
+            RC=$?
+          fi
           rm -f "$RUNNER_TEMP/june.p12"
           age -r "$AGE_RECIPIENT" -o "$OUT/build.log.age" "$LOG"
           APK=app/build/outputs/apk/gplay/release/app-gplay-${JUNE_ABI}-release.apk
@@ -355,6 +396,7 @@ jobs:
           rm -f "$LOG"
           [ -n "$TAIL_PID" ] && kill "$TAIL_PID" 2>/dev/null
           echo "result: $([ "$RC" -eq 0 ] && echo success || echo failure)  minutes: $(( ($(date +%s) - START) / 60 ))"
+          echo "retry429: $RETRY429"
           echo "RC=$RC" >> "$GITHUB_ENV"
 
       # PUB-69: after a timeout the Build step never encrypted its log; keep the partial log (encrypted) and drop the keystore.
@@ -375,6 +417,54 @@ jobs:
           tail -n 40 "$RUNNER_TEMP/mem.log" 2>/dev/null | grep -E '^mem [0-9:]+( [a-z0-9_]+=[0-9.]+)+$' || echo "memlog: empty"
           [ -f "$RUNNER_TEMP/memwatch.pid" ] && kill "$(cat "$RUNNER_TEMP/memwatch.pid")" 2>/dev/null
           true
+
+      # PUB-333: saved once, at the end, after "Keep partial build log" removed the keystore; only from a green run
+      # that missed the exact key (an existing key is never overwritten). The check refuses when the keystore is still
+      # there or anything in modules-2 names the app or the private repository; it prints fixed words and numbers only.
+      - name: Check dependency cache
+        id: depcheck
+        if: steps.depcache.outcome == 'success' && steps.depcache.outputs.cache-hit != 'true' && env.RC == '0' && env.TRC == '0'
+        env:
+          SRC_REPO: ${{ secrets.SRC_REPO }}
+        run: |
+          set -u
+          M="$HOME/.gradle/caches/modules-2"
+          WHY=
+          [ -d "$M/files-2.1" ] || WHY=empty
+          [ -e "$RUNNER_TEMP/june.p12" ] && WHY=keystore
+          PATS="$RUNNER_TEMP/depcheck.pats"
+          printf '%s\n' io.element.android.june > "$PATS"
+          if [ -n "${SRC_REPO:-}" ]; then printf '%s\n%s\n' "$SRC_REPO" "${SRC_REPO##*/}" >> "$PATS"; fi
+          if [ -z "$WHY" ]; then
+            D=("$M/files-2.1")
+            for d in "$M"/metadata-*; do [ -d "$d" ] && D+=("$d"); done
+            if find "${D[@]}" \( -type l -o -iname '*.p12' -o -iname '*.jks' -o -iname '*.keystore' \) -print 2>/dev/null | grep -q .; then
+              WHY=keystore-or-link
+            elif find "${D[@]}" -printf '%P\n' 2>/dev/null | grep -qiF -f "$PATS"; then
+              WHY=private-name
+            elif grep -rqiF -f "$PATS" --include='*.pom' --include='*.module' "$M/files-2.1" 2>/dev/null; then
+              WHY=private-name
+            elif [ "${#D[@]}" -gt 1 ] && grep -rqaiF -f "$PATS" "${D[@]:1}" 2>/dev/null; then
+              WHY=private-name
+            fi
+          fi
+          rm -f "$PATS"
+          if [ -z "$WHY" ]; then
+            echo "dependency cache: save  files $(find "$M/files-2.1" -type f | wc -l)  mb $(du -sm "$M" | cut -f1)"
+            echo "ok=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "dependency cache: not saved ($WHY)"
+            echo "ok=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save dependency cache
+        if: steps.depcheck.outputs.ok == '1'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/caches/modules-2/files-2.1
+            ~/.gradle/caches/modules-2/metadata-*
+          key: ${{ steps.depcache.outputs.cache-primary-key }}
 
       - name: Upload encrypted outputs
         if: always()
