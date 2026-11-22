@@ -41,6 +41,10 @@ on:
         description: "Caller's run tag shown in the run name (letters, digits and -, 64 at most; empty = none)"
         required: false
         default: ""
+      robo_wait_min:
+        description: "Minutes to keep waiting for the Robolectric jars after 429/5xx/network errors (0-120)"
+        required: false
+        default: "30"
 
 permissions:
   contents: read
@@ -57,6 +61,7 @@ env:
   JUNE_BUILD_MEMLOG: ${{ inputs.memlog || '1' }}
   JUNE_BUILD_GRADLE_XMX: ${{ inputs.gradle_xmx || '6g' }}
   JUNE_BUILD_KOTLIN_XMX: ${{ inputs.kotlin_xmx || '3g' }}
+  JUNE_BUILD_ROBO_WAIT_MIN: ${{ inputs.robo_wait_min || '30' }}
   GRADLE_OPTS: -Dorg.gradle.jvmargs=-Xmx${{ inputs.gradle_xmx || '6g' }} -XX:MaxMetaspaceSize=512m -Dfile.encoding=UTF-8 -XX:+UseG1GC -Dkotlin.daemon.jvm.options=-Xmx${{ inputs.kotlin_xmx || '3g' }} -Dorg.gradle.workers.max=4
 
 jobs:
@@ -177,6 +182,7 @@ jobs:
       # PUB-333: public library downloads only (modules-2 files + their metadata). Never transforms-*, build-cache-*,
       # jars-*, the wrapper, the source, ~/.ssh or $RUNNER_TEMP (no setup-gradle: it would also keep compiled app code).
       # Key = OS + hash of the fetched source's build files (src/ under the workspace, so hashFiles sees them).
+      # PUB-358: ~/.robolectric-jars = the public Robolectric runtime jars fetched (and hash-checked) by the next step.
       - name: Restore dependency cache
         id: depcache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -184,9 +190,404 @@ jobs:
           path: |
             ~/.gradle/caches/modules-2/files-2.1
             ~/.gradle/caches/modules-2/metadata-*
+            ~/.robolectric-jars
           key: ${{ runner.os }}-gradle-modules-${{ hashFiles('src/gradle/libs.versions.toml', 'src/gradle/wrapper/gradle-wrapper.properties', 'src/**/*.gradle.kts') }}
           restore-keys: |
             ${{ runner.os }}-gradle-modules-
+
+      # PUB-358 (run 45015410526: after the first Maven Central 429 Robolectric asked again for every test class, 378
+      # failed requests, all 126 classes failed): fetch each Robolectric runtime jar once, before the tests. Sources in
+      # order: GitHub release copy, Maven Central, Google mirror; every file is checked against the sha256 in JARS (or
+      # the repository's .sha1 where JARS has none) and dropped when it differs. 429/5xx/network on all sources: wait
+      # 1, 2, 4, 8 ... min (Retry-After when given) up to robo_wait_min minutes; 404 or a wrong hash on all: stop at
+      # once. Then the test JVMs read only these files (Gradle init script: robolectric.offline). Public log: fixed
+      # words and numbers; URLs and statuses go to robo.log, which the Unit tests step keeps in the encrypted test log.
+      - name: Robolectric jars (before unit tests)
+        working-directory: src
+        env:
+          TESTS: ${{ inputs.tests }}
+        run: |
+          set +e
+          if [ "${TESTS:-auto}" = "none" ]; then
+            echo "robolectric: skipped (tests none)"; exit 0
+          fi
+          python3 - <<'PY'
+          # PUB-358: one place for the jar table; tests/june-build/test_robo_prefetch.py runs this block
+          import email.utils
+          import hashlib
+          import os
+          import re
+          import shutil
+          import sys
+          import time
+          import urllib.error
+          import urllib.request
+
+          # The SDK -> version list is Robolectric 4.16.1's DefaultSdkProvider ("<android>-robolectric-<build>" + "-i7").
+          # New Robolectric or SDK: the coder bot uploads the new jar to a june-build release and fixes this table.
+          ROBOLECTRIC = "4.16.1"
+          REL = "https://github.com/icekloud/june-build/releases/download/"
+          # sdk: (android-all-instrumented version, sha256 ("" = check the repository's .sha1), GitHub release copy or "")
+          JARS = {
+              23: ("6.0.1_r3-robolectric-r1-i7", "", ""),
+              24: ("7.0.0_r1-robolectric-r1-i7", "57dc8d57a5d69adacf3aa4306aefbf147bd1621da347e20f3cf1f41c88a5dd49", REL + "deps-robolectric-7.0.0-i7/android-all-instrumented-7.0.0_r1-robolectric-r1-i7.jar"),
+              25: ("7.1.0_r7-robolectric-r1-i7", "", ""),
+              26: ("8.0.0_r4-robolectric-r1-i7", "712196356bf61fbcb186f41135c33e6d3416be31543d7be120a33bc898cc1208", REL + "deps-robolectric-8.0.0-i7/android-all-instrumented-8.0.0_r4-robolectric-r1-i7.jar"),
+              27: ("8.1.0-robolectric-4611349-i7", "", ""),
+              28: ("9-robolectric-4913185-2-i7", "", ""),
+              29: ("10-robolectric-5803371-i7", "", ""),
+              30: ("11-robolectric-6757853-i7", "7f4accae465a47e75e7591877b98e71fb982a908cffc4ba4b3ca0319cb6a0a10", REL + "deps-robolectric-11-i7/android-all-instrumented-11-robolectric-6757853-i7.jar"),
+              31: ("12-robolectric-7732740-i7", "", ""),
+              32: ("12.1-robolectric-8229987-i7", "", ""),
+              33: ("13-robolectric-9030017-i7", "1c3fd182c03d47626686ca3b39c4ec5bdb0898b1056f4eb8f96f32c6209a5c04", REL + "deps-robolectric-13-i7/android-all-instrumented-13-robolectric-9030017-i7.jar"),
+              34: ("14-robolectric-10818077-i7", "3fdac2d463f431c6b8d83b9d0ca739e795de75fffedee648c6761bd4bd864701", REL + "deps-robolectric-14-i7/android-all-instrumented-14-robolectric-10818077-i7.jar"),
+              35: ("15-robolectric-13954326-i7", "", ""),
+              36: ("16-robolectric-13921718-i7", "16f1f751643d1d3d5592008846bbdfc1e57cff15e6ec303d26584de3b6ac25ec",
+                   REL + "deps-robolectric-16-i7/android-all-instrumented-16-robolectric-13921718-i7.jar"),
+          }
+          REPOS = ("https://repo1.maven.org/maven2/", "https://maven-central.storage-download.googleapis.com/maven2/")
+          ARTIFACT = "org/robolectric/android-all-instrumented/"
+          CODES = {"M": 23, "N": 24, "N_MR1": 25, "O": 26, "O_MR1": 27, "P": 28, "Q": 29, "R": 30, "S": 31, "S_V2": 32,
+                   "TIRAMISU": 33, "UPSIDE_DOWN_CAKE": 34, "VANILLA_ICE_CREAM": 35, "BAKLAVA": 36}
+          FIRST_WAIT = 60  # s, doubled after every wait
+          TIMEOUT = 60  # s per connect/read
+          FAILED = "Robolectric jar 받기 실패({kind}, {tries}회, {minutes}분 대기)"  # read by the Build agent
+          OK, FAIL, ONLINE = 0, 1, 3
+          urlopen, sleep = urllib.request.urlopen, time.sleep
+
+
+          def jar_name(ver):
+              return f"android-all-instrumented-{ver}.jar"
+
+
+          def jar_dir():
+              return os.path.join(os.path.expanduser("~"), ".robolectric-jars")
+
+
+          def init_script():
+              return os.path.join(os.path.expanduser("~"), ".gradle", "init.d", "june-robolectric-offline.gradle")
+
+
+          class Log:
+              """Detail lines for robo.log (kept only in the encrypted test log) and the request count."""
+
+              def __init__(self):
+                  self.path = os.path.join(os.environ.get("RUNNER_TEMP", "."), "robo.log")
+                  self.requests = 0
+
+              def __call__(self, msg):
+                  with open(self.path, "a", encoding="utf-8") as f:
+                      f.write(msg + "\n")
+
+
+          def robolectric_version(root):
+              try:
+                  with open(os.path.join(root, "gradle", "libs.versions.toml"), encoding="utf-8") as f:
+                      toml = f.read()
+              except OSError:
+                  return ""
+              m = re.search(r'"org\.robolectric:robolectric:([\w.-]+)"', toml)
+              if not m:
+                  m = re.search(r'(?m)^\s*robolectric\s*=\s*"([\w.-]+)"', toml)
+              return m.group(1) if m else ""
+
+
+          def config_args(text):
+              """The argument text of every @Config(...) annotation."""
+              for m in re.finditer(r"@(?:org\.robolectric\.annotation\.)?Config\s*\(", text):
+                  i, depth = m.end(), 1
+                  while i < len(text) and depth:
+                      depth += {"(": 1, ")": -1}.get(text[i], 0)
+                      i += 1
+                  yield text[m.end():i - 1]
+
+
+          def values(args, key):
+              """Tokens of `key = 30`, `key = [N, 33]`, `key = {..}`, `key = intArrayOf(..)`; None when the key is absent."""
+              m = re.search(r"\b" + key + r"\s*=\s*", args)
+              if not m:
+                  return None
+              rest = args[m.end():]
+              b = re.match(r"\[([^\]]*)\]|\{([^}]*)\}|intArrayOf\(([^)]*)\)", rest)
+              body = next(g for g in b.groups() if g is not None) if b else rest.split(",")[0]
+              return [t.strip() for t in body.split(",") if t.strip()]
+
+
+          def level(tok):
+              """SDK level of one token, a list of levels (ALL_SDKS) or None when not understood."""
+              last = tok.split(".")[-1]
+              if re.fullmatch(r"\d+", tok):
+                  return int(tok)
+              if last in CODES:
+                  return CODES[last]
+              if last in ("NEWEST_SDK", "TARGET_SDK", "DEFAULT_SDK"):
+                  return max(JARS)
+              if last == "OLDEST_SDK":
+                  return min(JARS)
+              if last == "ALL_SDKS":
+                  return sorted(JARS)
+              return None
+
+
+          def wanted(args_list):
+              """(levels, tokens not understood) from @Config arguments / robolectric.properties as key=value text."""
+              out, unknown = set(), []
+              for args in args_list:
+                  for tok in values(args, "sdk") or []:
+                      lv = level(tok)
+                      if lv is None:
+                          unknown.append(tok)
+                      else:
+                          out.update(lv if isinstance(lv, list) else [lv])
+                  lo, hi = values(args, "minSdk"), values(args, "maxSdk")
+                  if lo or hi:
+                      lv = [level(t[0]) if t else d for t, d in ((lo, min(JARS)), (hi, max(JARS)))]
+                      if any(not isinstance(v, int) for v in lv):
+                          unknown += (lo or []) + (hi or [])
+                      else:
+                          out.update(s for s in JARS if lv[0] <= s <= lv[1])
+              return out, unknown
+
+
+          def source_sdks(root):
+              """(SDK levels the unit tests run on, tokens not understood). No @Config sdk = the default: targetSdk
+              when it is in JARS, else the newest one (targetSdk 37 > 36 here), so the newest is always included."""
+              args, target = [], set()
+              for d, dirs, files in os.walk(root):
+                  dirs[:] = [x for x in dirs if x not in (".git", "build", ".gradle")]
+                  rel = os.path.relpath(d, root).replace(os.sep, "/") + "/"
+                  test_dir = re.search(r"(^|/)src/test[^/]*/", rel)
+                  for fn in files:
+                      p = os.path.join(d, fn)
+                      if fn.endswith(".gradle.kts") or (fn.endswith(".kt") and re.match(r"(plugins|buildSrc)/", rel)):
+                          with open(p, encoding="utf-8", errors="replace") as f:
+                              target.update(int(v) for v in re.findall(
+                                  r"\b(?:TARGET_SDK|targetSdk(?:Version)?)\s*=\s*(\d+)\b", f.read()))
+                      if not test_dir:
+                          continue
+                      if fn.endswith((".kt", ".java")):
+                          with open(p, encoding="utf-8", errors="replace") as f:
+                              args += list(config_args(f.read()))
+                      elif fn == "robolectric.properties":
+                          with open(p, encoding="utf-8", errors="replace") as f:
+                              props = dict(re.findall(r"(?m)^\s*(sdk|minSdk|maxSdk)\s*=\s*(.*?)\s*$", f.read()))
+                          args.append(", ".join(f"{k} = [{v}]" for k, v in props.items()))
+              sdks, unknown = wanted(args)
+              sdks.add(max(JARS))
+              sdks.update(t for t in target if t in JARS)
+              return sdks, unknown
+
+
+          def file_hash(path, algo):
+              h = hashlib.new(algo)
+              with open(path, "rb") as f:
+                  for chunk in iter(lambda: f.read(1 << 20), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+
+          def have(path, sha256):
+              """True when the jar is already here and its hash is right (a wrong file is removed)."""
+              if not os.path.isfile(path):
+                  return False
+              if sha256:
+                  ok = file_hash(path, "sha256") == sha256
+              else:
+                  try:
+                      with open(path + ".sha1", encoding="ascii") as f:
+                          ok = f.read().strip() == file_hash(path, "sha1")
+                  except OSError:
+                      ok = False
+              if not ok:
+                  for p in (path, path + ".sha1"):
+                      if os.path.exists(p):
+                          os.remove(p)
+              return ok
+
+
+          class Miss(Exception):
+              def __init__(self, kind, retry_after=None):
+                  super().__init__(kind)
+                  self.kind, self.retry_after = kind, retry_after
+
+
+          def retry_after(value):
+              if not value:
+                  return None
+              if value.strip().isdigit():
+                  return int(value.strip())
+              try:
+                  return max(0, int(email.utils.parsedate_to_datetime(value).timestamp() - time.time()))
+              except (TypeError, ValueError):
+                  return None
+
+
+          def get(log, url, dest=None):
+              """Body text (dest None) or the file written to dest; raises Miss(kind) with kind 429|5xx|network|http<code>."""
+              log.requests += 1
+              try:
+                  with urlopen(urllib.request.Request(url, headers={"User-Agent": "june-build"}), timeout=TIMEOUT) as r:
+                      if dest is None:
+                          body = r.read(4096).decode("ascii", "replace")
+                      else:
+                          with open(dest, "wb") as f:
+                              for chunk in iter(lambda: r.read(1 << 20), b""):
+                                  f.write(chunk)
+                          body = None
+                  log(f"GET {url} -> 200")
+                  return body
+              except urllib.error.HTTPError as e:
+                  ra = retry_after(e.headers.get("Retry-After") if e.headers else None)
+                  log(f"GET {url} -> HTTP {e.code}" + (f" retry-after {ra}s" if ra is not None else ""))
+                  kind = "429" if e.code == 429 else "5xx" if e.code >= 500 else "408" if e.code == 408 else f"http{e.code}"
+                  raise Miss(kind, ra)
+              except Exception as e:  # URLError, timeouts, resets, short reads
+                  log(f"GET {url} -> network {type(e).__name__}")
+                  raise Miss("network")
+
+
+          def transient(kind):
+              return kind in ("429", "5xx", "408", "network")
+
+
+          def fetch_once(log, ver, sha256, rel, dest):
+              """One round over all sources; returns None when the jar is in place, else the list of Miss kinds."""
+              path = ARTIFACT + f"{ver}/" + jar_name(ver)
+              sources = ([(rel, None)] if rel else []) + [(base + path, base + path + ".sha1") for base in REPOS]
+              misses = []
+              for url, sha1_url in sources:
+                  part = dest + ".part"
+                  try:
+                      want = sha256
+                      if not want:
+                          want = (re.findall(r"[0-9a-f]{40}", get(log, sha1_url).lower()) or ["?"])[0]
+                      get(log, url, part)
+                      got = file_hash(part, "sha256" if sha256 else "sha1")
+                      if got != want:
+                          log(f"hash differs ({'sha256' if sha256 else 'sha1'} {got}, want {want}), dropped")
+                          raise Miss("hash")
+                      os.replace(part, dest)
+                      if not sha256:
+                          with open(dest + ".sha1", "w", encoding="ascii") as f:
+                              f.write(want + "\n")
+                      log(f"ok {jar_name(ver)} ({'sha256' if sha256 else 'sha1'} {got})")
+                      return None
+                  except Miss as m:
+                      misses.append(m)
+                  finally:
+                      if os.path.exists(part):
+                          os.remove(part)
+              return misses
+
+
+          def failed(kinds, tries, waited):
+              kind = next((k for k in ("429", "5xx", "408", "network", "hash") if k in kinds), sorted(kinds)[0])
+              return FAILED.format(kind=kind, tries=tries, minutes=round(waited / 60))
+
+
+          def tidy(d):
+              """Keep only table jars and their .sha1 notes (the folder goes into the public dependency cache)."""
+              keep = {jar_name(v) for v, _, _ in JARS.values()}
+              keep |= {n + ".sha1" for n in keep}
+              for n in os.listdir(d):
+                  p = os.path.join(d, n)
+                  if n not in keep or os.path.islink(p) or not os.path.isfile(p):
+                      if os.path.isdir(p) and not os.path.islink(p):
+                          shutil.rmtree(p)
+                      else:
+                          os.remove(p)
+
+
+          def write_init(d):
+              p = init_script()
+              os.makedirs(os.path.dirname(p), exist_ok=True)
+              with open(p, "w", encoding="utf-8") as f:
+                  f.write("// PUB-358: written by the june-build workflow. Robolectric reads its runtime jars only from\n"
+                          "// this folder (LocalDependencyResolver); a missing jar fails the test, nothing is fetched.\n"
+                          "allprojects {\n"
+                          "    tasks.withType(Test).configureEach {\n"
+                          "        systemProperty 'robolectric.offline', 'true'\n"
+                          f"        systemProperty 'robolectric.dependency.dir', '{d}'\n"
+                          "    }\n"
+                          "}\n")
+
+
+          def main(root="."):
+              log = Log()
+              wait_min = os.environ.get("JUNE_BUILD_ROBO_WAIT_MIN", "30")
+              if not re.fullmatch(r"\d{1,3}", wait_min) or int(wait_min) > 120:
+                  print("robo_wait_min must be 0-120")
+                  log(FAILED.format(kind="input", tries=0, minutes=0))
+                  return FAIL
+              limit = int(wait_min) * 60
+              ver = robolectric_version(root)
+              if ver != ROBOLECTRIC:
+                  why = "not in libs.versions.toml" if not ver else "version not in table"
+                  print(f"robolectric: {why}, tests online")
+                  log(f"robolectric {ver or '-'}: {why} (table {ROBOLECTRIC}), no prefetch")
+                  return ONLINE
+              sdks, unknown = source_sdks(root)
+              if unknown:
+                  print(f"robolectric: sdk value not understood ({len(unknown)}), tests online")
+                  log(f"sdk values not understood: {', '.join(sorted(set(unknown)))}; no prefetch")
+                  return ONLINE
+              missing = sorted(s for s in sdks if s not in JARS)
+              if missing:
+                  print(f"robolectric: sdk not in table ({len(missing)}), tests online")
+                  log(f"sdk not in table: {missing}; no prefetch")
+                  return ONLINE
+              d = jar_dir()
+              os.makedirs(d, exist_ok=True)
+              tidy(d)
+              log(f"robolectric {ver}, sdks {', '.join(map(str, sorted(sdks)))}, wait limit {limit}s")
+              waited, delay, fetched, cached = 0, FIRST_WAIT, 0, 0
+              for sdk in sorted(sdks):
+                  ver_i, sha256, rel = JARS[sdk]
+                  dest = os.path.join(d, jar_name(ver_i))
+                  if have(dest, sha256):
+                      cached += 1
+                      log(f"cached {jar_name(ver_i)}")
+                      continue
+                  tries = 0
+                  while True:
+                      tries += 1
+                      misses = fetch_once(log, ver_i, sha256, rel, dest)
+                      if misses is None:
+                          fetched += 1
+                          break
+                      kinds = [m.kind for m in misses]
+                      if not any(transient(k) for k in kinds) or waited >= limit:
+                          line = failed(kinds, tries, waited)
+                          print(line)
+                          log(line)
+                          return FAIL
+                      ra = [m.retry_after for m in misses if transient(m.kind) and m.retry_after is not None]
+                      pause = min(max([delay] + ra), limit - waited)  # Retry-After when longer than the backoff
+                      print(f"robolectric: 받기 실패 {tries}회, {pause}초 기다림")
+                      log(f"round {tries} failed ({', '.join(kinds)}), wait {pause}s")
+                      sleep(pause)
+                      waited += pause
+                      delay *= 2
+              write_init(d)
+              print(f"robolectric: offline  jars {len(sdks)}  fetched {fetched}  cached {cached}  "
+                    f"requests {log.requests}  waited_s {waited}")
+              return OK
+
+
+          if __name__ == "__main__":
+              try:
+                  sys.exit(main())
+              except Exception as exc:  # public log: fixed words only, the type goes to robo.log
+                  print(FAILED.format(kind="error", tries=0, minutes=0))
+                  Log()(f"error {type(exc).__name__}: {exc}\n" + FAILED.format(kind="error", tries=0, minutes=0))
+                  sys.exit(FAIL)
+          PY
+          case $? in
+            0) echo "ROBO=ok" >> "$GITHUB_ENV" ;;
+            3) echo "ROBO=online" >> "$GITHUB_ENV" ;;
+            1) echo "ROBO=fail" >> "$GITHUB_ENV" ;;
+            *) echo "Robolectric jar 받기 실패(error, 0회, 0분 대기)" | tee -a "$RUNNER_TEMP/robo.log"; echo "ROBO=fail" >> "$GITHUB_ENV" ;;
+          esac
 
       - name: Unit tests (output kept only in the encrypted log)
         working-directory: src
@@ -297,12 +698,23 @@ jobs:
           if [ "$N" -eq 0 ]; then
             echo "tests: no changed module with unit tests"; echo "TRC=0" >> "$GITHUB_ENV"; exit 0
           fi
+          # PUB-358: the Robolectric jars could not be fetched in time -> no tests (they would all fail, not a code
+          # problem). The encrypted test log keeps the tasks line first, then robo.log with the fixed failure line.
+          if [ "${ROBO:-}" = "fail" ]; then
+            { echo "tasks: $TASKS${WHY:+  ($WHY)}"; cat "$RUNNER_TEMP/robo.log" 2>/dev/null; } > "$TLOG"
+            age -r "$AGE_RECIPIENT" -o "$OUT/test.log.age" "$TLOG"
+            rm -f "$TLOG" "$RUNNER_TEMP/robo.log"
+            echo "tests: not run (Robolectric jar 받기 실패)  tasks: $N"
+            echo "TRC=1" >> "$GITHUB_ENV"; exit 0
+          fi
           {
             echo "tasks: $TASKS${WHY:+  ($WHY)}"
+            cat "$RUNNER_TEMP/robo.log" 2>/dev/null
             python3 .github/june/write_firebase_xml.py
             ./gradlew $TASKS --continue --no-configuration-cache --console=plain
           } > "$TLOG" 2>&1
           TRC=$?
+          rm -f "$RUNNER_TEMP/robo.log"
           # PUB-333: Maven Central 429 -> wait 60-120 s, run the same Gradle command once more (public log: one fixed line)
           RETRY429=0
           if [ "$TRC" -ne 0 ] && grep -qF 'status code 429' "$TLOG" 2>/dev/null; then
@@ -448,6 +860,12 @@ jobs:
               WHY=private-name
             fi
           fi
+          # PUB-358: the Robolectric folder may hold only the hash-checked runtime jars and their .sha1 notes
+          R="$HOME/.robolectric-jars"
+          if [ -z "$WHY" ] && { [ -L "$R" ] || { [ -e "$R" ] && find "$R" -mindepth 1 \( -type l -o -type d -o \! \( \
+              -name 'android-all-instrumented-*.jar' -o -name 'android-all-instrumented-*.jar.sha1' \) \) -print | grep -q .; }; }; then
+            WHY=robo-extra
+          fi
           rm -f "$PATS"
           if [ -z "$WHY" ]; then
             echo "dependency cache: save  files $(find "$M/files-2.1" -type f | wc -l)  mb $(du -sm "$M" | cut -f1)"
@@ -464,6 +882,7 @@ jobs:
           path: |
             ~/.gradle/caches/modules-2/files-2.1
             ~/.gradle/caches/modules-2/metadata-*
+            ~/.robolectric-jars
           key: ${{ steps.depcache.outputs.cache-primary-key }}
 
       - name: Upload encrypted outputs
