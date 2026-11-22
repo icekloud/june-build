@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # Memory watcher for the june-build workflow (PUB-69).
 # Prints one line every INTERVAL seconds (default 30) until it gets TERM/INT:
-#   mem HH:MM:SS avail_mb=N swap_used_mb=N load1=N.NN java_rss_mb=N
+#   mem [JOB ]HH:MM:SS avail_mb=N swap_used_mb=N load1=N.NN java_rss_mb=N
+# PUB-379: JOB (2nd argument, e.g. tests or apk) heads the numbers when given; a value that is not a short lowercase
+# word is left out.
 # Only numbers: no command lines, paths or environment values, so the lines may go to the public log.
 # java_rss_mb is the RSS of the largest process named "java" (0 when none).
 # MEMWATCH_PROC overrides /proc (tests use a fake tree).
 set -u
 
 INTERVAL="${1:-30}"
+JOB="${2:-}"
+[[ "$JOB" =~ ^[a-z][a-z0-9]{0,15}$ ]] || JOB=
 PROC="${MEMWATCH_PROC:-/proc}"
 
 SLEEP_PID=
@@ -26,8 +30,8 @@ sample() {
     rss=$(awk '/^VmRSS:/ {print int($2 / 1024)}' "$d/status" 2>/dev/null)
     [ -n "$rss" ] && [ "$rss" -gt "$best" ] && best=$rss
   done
-  printf 'mem %s avail_mb=%d swap_used_mb=%d load1=%s java_rss_mb=%d\n' \
-    "$(date +%H:%M:%S)" "${avail:-0}" "$(( ${swap_total:-0} - ${swap_free:-0} ))" "${load:-0.00}" "$best"
+  printf 'mem %s%s avail_mb=%d swap_used_mb=%d load1=%s java_rss_mb=%d\n' \
+    "${JOB:+$JOB }" "$(date +%H:%M:%S)" "${avail:-0}" "$(( ${swap_total:-0} - ${swap_free:-0} ))" "${load:-0.00}" "$best"
 }
 
 while :; do
