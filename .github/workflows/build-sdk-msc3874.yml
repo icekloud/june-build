@@ -1,0 +1,255 @@
+name: build-sdk-msc3874
+
+# Manual build of the Matrix Rust SDK Android library (sdk-android AAR) used by the June app:
+# upstream matrix-rust-sdk 8feab427 (SDK 26.09.26) plus the MSC3874 patches kept in the private
+# app repository (tools/sdk/patches/msc3874). Nothing from the private repository is printed here.
+# Outputs (AAR and the full logs) are encrypted for the maintainer before upload or caching.
+# The public log shows only pass/fail, counts and minutes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_ref:
+        description: "App commit SHA (40 hex) that holds tools/sdk/patches/msc3874"
+        required: true
+      x86_64:
+        description: "Also build x86_64-linux-android (emulator); adds about 11 minutes"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-sdk
+  cancel-in-progress: false
+
+env:
+  AGE_RECIPIENT: age1d65p0upyycrevqzlj6ezvnrn9sd7wcznaxyjdr7wfl4k8ysl9sesuk78pg
+  SDK_COMMIT: 8feab427ae99eb199ab66a8dddb391e3d3a5d7c9
+  COMPONENTS_TAG: sdk-v26.09.26
+  COMPONENTS_COMMIT: a9be84bd16c5fa1be1b4bb1c6addc5b4f80b3781
+  RUMA_CLIENT_API_SHA256: 6a6187ddda33fefafe3a738f40075ce2e8a7ecd3606998d2a885cf6dac73629d
+  NDK_VERSION: 29.0.14206865
+  # Bump when the build steps below change, so that a cached AAR is not reused.
+  BUILD_REV: "1"
+  # Same as the upstream release workflow.
+  RUSTFLAGS: "-Clink-args=-Wl,--build-id"
+  GRADLE_OPTS: -Dorg.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+        with:
+          tool-cache: true
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: Add swap (LTO link)
+        run: |
+          sudo fallocate -l 8G /swapfile_sdk
+          sudo chmod 600 /swapfile_sdk
+          sudo mkswap /swapfile_sdk >/dev/null
+          sudo swapon /swapfile_sdk
+          echo "swap ready"
+
+      - name: Install age
+        run: sudo apt-get install -y -qq age >/dev/null 2>&1
+
+      - name: Fetch patches
+        env:
+          DEPLOY_KEY: ${{ secrets.PRIVATE_SRC_DEPLOY_KEY }}
+          SRC_REPO: ${{ secrets.SRC_REPO }}
+          REF: ${{ inputs.app_ref }}
+          X86_64: ${{ inputs.x86_64 }}
+        run: |
+          set -eu
+          echo "$REF" | grep -Eq '^[0-9a-f]{40}$' || { echo "app_ref must be a 40-hex commit SHA"; exit 1; }
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/src_key; chmod 600 ~/.ssh/src_key
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/src_key -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
+          mkdir app; cd app
+          git init -q
+          git remote add origin "git@github.com:${SRC_REPO}.git"
+          # Only the patch folder is needed: no blobs except the ones checked out below.
+          git fetch -q --depth 1 --filter=blob:none origin "$REF" >/dev/null 2>&1 || { echo "fetch failed"; exit 1; }
+          git checkout -q FETCH_HEAD -- tools/sdk/patches/msc3874 >/dev/null 2>&1 || { echo "checkout failed"; exit 1; }
+          rm -f ~/.ssh/src_key
+          mkdir -p "$RUNNER_TEMP/patches" "$RUNNER_TEMP/out"
+          cp tools/sdk/patches/msc3874/*.patch "$RUNNER_TEMP/patches/"
+          cd ..; rm -rf app
+          TARGETS="aarch64-linux-android"
+          if [ "$X86_64" = "true" ]; then TARGETS="$TARGETS x86_64-linux-android"; fi
+          PATCH_HASH=$(cat "$RUNNER_TEMP"/patches/*.patch | sha256sum | cut -c1-16)
+          echo "TARGETS=$TARGETS" >> "$GITHUB_ENV"
+          echo "CACHE_KEY=sdk-msc3874-r${BUILD_REV}-${SDK_COMMIT:0:12}-${PATCH_HASH}-$(echo $TARGETS | tr ' ' '+')" >> "$GITHUB_ENV"
+          echo "patches: $(ls "$RUNNER_TEMP/patches" | wc -l)  targets: $(echo $TARGETS | wc -w)"
+
+      # The cached file is the age-encrypted AAR, so a cache read by any other workflow run
+      # reveals nothing.
+      - name: Restore cached AAR
+        id: cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/cached
+          key: ${{ env.CACHE_KEY }}
+
+      - name: Use JDK 17
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Rust
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+
+      - name: Install Protoc
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare toolchain
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set +e
+          START=$(date +%s)
+          NDK_PATH="$ANDROID_HOME/ndk/$NDK_VERSION"
+          [ -d "$NDK_PATH" ] || { echo "NDK $NDK_VERSION not found on the runner"; exit 1; }
+          echo "ANDROID_NDK_HOME=$NDK_PATH" >> "$GITHUB_ENV"
+          {
+            for t in $TARGETS; do rustup target add "$t"; done
+            cargo install --locked cargo-ndk
+          } > "$RUNNER_TEMP/toolchain.log" 2>&1
+          RC=$?
+          age -r "$AGE_RECIPIENT" -o "$RUNNER_TEMP/out/toolchain.log.age" "$RUNNER_TEMP/toolchain.log"
+          rm -f "$RUNNER_TEMP/toolchain.log"
+          echo "toolchain: $([ "$RC" -eq 0 ] && echo success || echo failure)  minutes: $(( ($(date +%s) - START) / 60 ))"
+          exit $RC
+
+      # Resets ANDROID_HOME to a fresh SDK without the NDK, so it runs after the NDK path is kept
+      # (same order as the upstream release workflow).
+      - name: Install Android SDK
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: malinskiy/action-android/install-sdk@fa103ef30331e95f266418a6a97e98f61f626887 # v0.1.7
+
+      - name: Fetch SDK sources and apply patches
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -eu
+          {
+            git init -q sdk
+            git -C sdk fetch -q --depth 1 https://github.com/matrix-org/matrix-rust-sdk.git "$SDK_COMMIT"
+            git -C sdk checkout -q FETCH_HEAD
+            git init -q components
+            git -C components fetch -q --depth 1 https://github.com/matrix-org/matrix-rust-components-kotlin.git "refs/tags/$COMPONENTS_TAG"
+            git -C components checkout -q FETCH_HEAD
+          } >/dev/null 2>&1 || { echo "upstream fetch failed"; exit 1; }
+          [ "$(git -C sdk rev-parse HEAD)" = "$SDK_COMMIT" ] || { echo "unexpected SDK commit"; exit 1; }
+          [ "$(git -C components rev-parse HEAD)" = "$COMPONENTS_COMMIT" ] || { echo "unexpected components commit"; exit 1; }
+          curl -sSfL -o "$RUNNER_TEMP/rca.crate" https://static.crates.io/crates/ruma-client-api/ruma-client-api-0.25.0.crate
+          echo "$RUMA_CLIENT_API_SHA256  $RUNNER_TEMP/rca.crate" | sha256sum -c --quiet - || { echo "crate checksum mismatch"; exit 1; }
+          mkdir -p sdk/vendor/ruma-client-api
+          tar xzf "$RUNNER_TEMP/rca.crate" -C sdk/vendor/ruma-client-api --strip-components=1
+          N=0
+          for p in "$RUNNER_TEMP"/patches/*.patch; do
+            git -C sdk apply "$p" >/dev/null 2>&1 || { echo "patch $((N + 1)) failed to apply"; exit 1; }
+            N=$((N + 1))
+          done
+          echo "SDK_PATH=$GITHUB_WORKSPACE/sdk" >> "$GITHUB_ENV"
+          echo "patches applied: $N"
+
+      - name: Rust tests (output kept only in the encrypted log)
+        if: steps.cache.outputs.cache-hit != 'true'
+        working-directory: sdk
+        run: |
+          set +e
+          START=$(date +%s)
+          TLOG="$RUNNER_TEMP/test.log"
+          cargo test -p matrix-sdk --features testing --test integration -- --exact \
+            event_cache::test_backpaginate_excludes_edits_when_enabled \
+            event_cache::test_backpaginate_keeps_edits_by_default > "$TLOG" 2>&1
+          TRC=$?
+          PASSED=$(grep -Eo 'test result: [a-z]+\. [0-9]+ passed' "$TLOG" | grep -Eo '[0-9]+' | awk '{s+=$1} END {print s+0}')
+          FAILED=$(grep -Eo '[0-9]+ failed' "$TLOG" | grep -Eo '[0-9]+' | awk '{s+=$1} END {print s+0}')
+          age -r "$AGE_RECIPIENT" -o "$RUNNER_TEMP/out/test.log.age" "$TLOG"
+          rm -f "$TLOG"
+          # The debug build is not needed any more; give the disk back to the release build.
+          rm -rf target/debug
+          echo "tests: $([ "$TRC" -eq 0 ] && echo success || echo failure)  passed $PASSED  failed $FAILED  minutes: $(( ($(date +%s) - START) / 60 ))"
+          # Both tests must have run: a renamed test would otherwise pass with 0 tests.
+          [ "$TRC" -eq 0 ] && [ "$PASSED" -eq 2 ]
+
+      - name: Build AAR (output kept only in the encrypted log)
+        if: steps.cache.outputs.cache-hit != 'true'
+        working-directory: components
+        run: |
+          set +e
+          START=$(date +%s)
+          LOG="$RUNNER_TEMP/build.log"
+          OBJCOPY="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-objcopy"
+          (
+            set -e
+            for t in $TARGETS; do
+              echo "== target $t"
+              bash scripts/build-rust-for-target.sh -p "$SDK_PATH" -m sdk -t "$t" -r
+            done
+            # Same size as the upstream release: drop the symbols the profile keeps.
+            find sdk/sdk-android/src/main/jniLibs -name libmatrix_sdk_ffi.so \
+              -exec "$OBJCOPY" --strip-debug --strip-unneeded {} \;
+            ./gradlew :sdk:sdk-android:assembleRelease --console=plain
+          ) > "$LOG" 2>&1
+          RC=$?
+          ./gradlew --stop >/dev/null 2>&1
+          age -r "$AGE_RECIPIENT" -o "$RUNNER_TEMP/out/build.log.age" "$LOG"
+          rm -f "$LOG"
+          AAR=sdk/sdk-android/build/outputs/aar/sdk-android-release.aar
+          MB=0
+          if [ "$RC" -eq 0 ] && [ -f "$AAR" ]; then
+            MB=$(( $(stat -c %s "$AAR") / 1048576 ))
+            mkdir -p "$RUNNER_TEMP/cached"
+            age -r "$AGE_RECIPIENT" -o "$RUNNER_TEMP/cached/sdk-android-msc3874.aar.age" "$AAR"
+          else
+            RC=1
+          fi
+          echo "build: $([ "$RC" -eq 0 ] && echo success || echo failure)  targets: $(echo $TARGETS | wc -w)  aar_mb: $MB  minutes: $(( ($(date +%s) - START) / 60 ))"
+          exit $RC
+
+      - name: Save AAR to cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/cached
+          key: ${{ env.CACHE_KEY }}
+
+      - name: Collect outputs
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/cached/sdk-android-msc3874.aar.age" ]; then
+            cp "$RUNNER_TEMP/cached/sdk-android-msc3874.aar.age" "$RUNNER_TEMP/out/"
+          fi
+          echo "cache: $([ '${{ steps.cache.outputs.cache-hit }}' = 'true' ] && echo hit || echo miss)  files: $(ls "$RUNNER_TEMP/out" 2>/dev/null | wc -l)"
+
+      - name: Upload encrypted outputs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sdk-out
+          path: ${{ runner.temp }}/out/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Status
+        run: test -f "$RUNNER_TEMP/out/sdk-android-msc3874.aar.age"
