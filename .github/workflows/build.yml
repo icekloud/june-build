@@ -62,6 +62,10 @@ env:
   JUNE_BUILD_MEMLOG: ${{ inputs.memlog || '1' }}
   JUNE_BUILD_GRADLE_XMX: ${{ inputs.gradle_xmx || '6g' }}
   JUNE_BUILD_KOTLIN_XMX: ${{ inputs.kotlin_xmx || '3g' }}
+  # PUB-435: MSC3874-patched Matrix Rust SDK (built and encrypted by build-sdk-msc3874.yml), kept on the private
+  # repository's branch june-sdk-aar and pinned here by commit and sha256. Empty SDK_AAR_SHA256 = Maven SDK (rollback).
+  SDK_AAR_COMMIT: "3d7370964367c850bce8b39f2a4368a738e238e8"
+  SDK_AAR_SHA256: "a5797a0cf3092e275d67304d668935f4b14ed5f9be695be37a57498e18dca92e"
   JUNE_BUILD_ROBO_WAIT_MIN: ${{ inputs.robo_wait_min || '30' }}
   GRADLE_OPTS: -Dorg.gradle.jvmargs=-Xmx${{ inputs.gradle_xmx || '6g' }} -XX:MaxMetaspaceSize=512m -Dfile.encoding=UTF-8 -XX:+UseG1GC -Dkotlin.daemon.jvm.options=-Xmx${{ inputs.kotlin_xmx || '3g' }} -Dorg.gradle.workers.max=4
 
@@ -892,6 +896,31 @@ jobs:
           rm -f ~/.ssh/src_key
           mkdir -p "$RUNNER_TEMP/out"
           echo "source ready"
+
+      # PUB-435: put the patched SDK where libraries/matrix/impl looks for it (libraries/rustsdk/matrix-rust-sdk.aar).
+      # Public log: one word. The file is checked against SDK_AAR_SHA256 before use.
+      - name: Fetch patched SDK
+        if: env.SDK_AAR_SHA256 != ''
+        env:
+          DEPLOY_KEY: ${{ secrets.PRIVATE_SRC_DEPLOY_KEY }}
+          SRC_REPO: ${{ secrets.SRC_REPO }}
+        run: |
+          set -eu
+          echo "$SDK_AAR_COMMIT" | grep -Eq '^[0-9a-f]{40}$' || { echo "sdk commit must be 40 hex"; exit 1; }
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/src_key; chmod 600 ~/.ssh/src_key
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/src_key -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
+          D="$RUNNER_TEMP/sdkaar"; mkdir "$D"; cd "$D"; git init -q
+          if ! git fetch -q --depth 1 "git@github.com:${SRC_REPO}.git" "$SDK_AAR_COMMIT" >/dev/null 2>&1; then
+            rm -f ~/.ssh/src_key; echo "sdk fetch failed"; exit 1
+          fi
+          rm -f ~/.ssh/src_key
+          git checkout -q FETCH_HEAD -- matrix-rust-sdk.aar >/dev/null 2>&1 || { echo "sdk checkout failed"; exit 1; }
+          echo "$SDK_AAR_SHA256  matrix-rust-sdk.aar" | sha256sum -c --quiet - >/dev/null 2>&1 || { echo "sdk checksum mismatch"; exit 1; }
+          cp matrix-rust-sdk.aar "$GITHUB_WORKSPACE/src/libraries/rustsdk/matrix-rust-sdk.aar"
+          cd "$GITHUB_WORKSPACE"; rm -rf "$D"
+          echo "sdk: patched"
 
       # PUB-333: public library downloads only (modules-2 files + their metadata). Never transforms-*, build-cache-*,
       # jars-*, the wrapper, the source, ~/.ssh or $RUNNER_TEMP (no setup-gradle: it would also keep compiled app code).
