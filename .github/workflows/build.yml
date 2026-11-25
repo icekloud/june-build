@@ -64,8 +64,8 @@ env:
   JUNE_BUILD_KOTLIN_XMX: ${{ inputs.kotlin_xmx || '3g' }}
   # PUB-435: MSC3874-patched Matrix Rust SDK (built and encrypted by build-sdk-msc3874.yml), kept on the private
   # repository's branch june-sdk-aar and pinned here by commit and sha256. Empty SDK_AAR_SHA256 = Maven SDK (rollback).
-  SDK_AAR_COMMIT: "b313f31020b0515e6307cf3f49c3100550a8c7dd"
-  SDK_AAR_SHA256: "c4f79641b7fdf328f30457fb170e78b8c41051756b6bc4bfdfad928b0b35e504"
+  SDK_AAR_COMMIT: "f2eb9085e89e016cbe5ea3514510ff1a8e5eb6ed"
+  SDK_AAR_SHA256: "37f10bbb7b710c3bacf59aba1a172ab550dc253f2a0fc6107b696d1d1016acb7"
   JUNE_BUILD_ROBO_WAIT_MIN: ${{ inputs.robo_wait_min || '30' }}
   GRADLE_OPTS: -Dorg.gradle.jvmargs=-Xmx${{ inputs.gradle_xmx || '6g' }} -XX:MaxMetaspaceSize=512m -Dfile.encoding=UTF-8 -XX:+UseG1GC -Dkotlin.daemon.jvm.options=-Xmx${{ inputs.kotlin_xmx || '3g' }} -Dorg.gradle.workers.max=4
 
