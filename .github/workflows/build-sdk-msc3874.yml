@@ -184,7 +184,11 @@ jobs:
             event_cache::test_backpaginate_overlapping_sync_gaps_fetched_twice_by_default \
             event_cache::test_backpaginate_overlapping_sync_gaps_fetched_once_when_enabled \
             event_cache::test_backpaginate_overlapping_response_fetched_twice_by_default \
-            event_cache::test_backpaginate_overlapping_response_fetched_once_when_enabled > "$TLOG" 2>&1
+            event_cache::test_backpaginate_overlapping_response_fetched_once_when_enabled \
+            event_cache::test_backpaginate_hidden_event_gaps_fetched_each_by_default \
+            event_cache::test_backpaginate_hidden_event_gaps_fetched_once_when_enabled \
+            event_cache::test_backpaginate_hidden_event_gaps_in_store_fetched_each_by_default \
+            event_cache::test_backpaginate_hidden_event_gaps_in_store_fetched_once_when_enabled > "$TLOG" 2>&1
           TRC=$?
           PASSED=$(grep -Eo 'test result: [a-z]+\. [0-9]+ passed' "$TLOG" | grep -Eo '[0-9]+' | awk '{s+=$1} END {print s+0}')
           FAILED=$(grep -Eo '[0-9]+ failed' "$TLOG" | grep -Eo '[0-9]+' | awk '{s+=$1} END {print s+0}')
@@ -194,7 +198,7 @@ jobs:
           rm -rf target/debug
           echo "tests: $([ "$TRC" -eq 0 ] && echo success || echo failure)  passed $PASSED  failed $FAILED  minutes: $(( ($(date +%s) - START) / 60 ))"
           # All the tests must have run: a renamed test would otherwise pass with 0 tests.
-          [ "$TRC" -eq 0 ] && [ "$PASSED" -eq 6 ]
+          [ "$TRC" -eq 0 ] && [ "$PASSED" -eq 10 ]
 
       - name: Build AAR (output kept only in the encrypted log)
         if: steps.cache.outputs.cache-hit != 'true'
