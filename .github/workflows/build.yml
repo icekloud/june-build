@@ -192,6 +192,7 @@ jobs:
       # jars-*, the wrapper, the source, ~/.ssh or $RUNNER_TEMP (no setup-gradle: it would also keep compiled app code).
       # Key = OS + hash of the fetched source's build files (src/ under the workspace, so hashFiles sees them).
       # PUB-358: ~/.robolectric-jars = the public Robolectric runtime jars fetched (and hash-checked) by the next step.
+      # PUB-496: "-t1" = caches that also hold the unit-test libraries (older keys are still read through restore-keys).
       - name: Restore dependency cache
         id: depcache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -200,7 +201,7 @@ jobs:
             ~/.gradle/caches/modules-2/files-2.1
             ~/.gradle/caches/modules-2/metadata-*
             ~/.robolectric-jars
-          key: ${{ runner.os }}-gradle-modules-${{ hashFiles('src/gradle/libs.versions.toml', 'src/gradle/wrapper/gradle-wrapper.properties', 'src/**/*.gradle.kts') }}
+          key: ${{ runner.os }}-gradle-modules-${{ hashFiles('src/gradle/libs.versions.toml', 'src/gradle/wrapper/gradle-wrapper.properties', 'src/**/*.gradle.kts') }}-t1
           restore-keys: |
             ${{ runner.os }}-gradle-modules-
 
@@ -926,6 +927,7 @@ jobs:
       # jars-*, the wrapper, the source, ~/.ssh or $RUNNER_TEMP (no setup-gradle: it would also keep compiled app code).
       # Key = OS + hash of the fetched source's build files (src/ under the workspace, so hashFiles sees them).
       # PUB-358: ~/.robolectric-jars = the public Robolectric runtime jars fetched (and hash-checked) by the next step.
+      # PUB-496: "-t1" = caches that also hold the unit-test libraries (older keys are still read through restore-keys).
       - name: Restore dependency cache
         id: depcache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -934,7 +936,7 @@ jobs:
             ~/.gradle/caches/modules-2/files-2.1
             ~/.gradle/caches/modules-2/metadata-*
             ~/.robolectric-jars
-          key: ${{ runner.os }}-gradle-modules-${{ hashFiles('src/gradle/libs.versions.toml', 'src/gradle/wrapper/gradle-wrapper.properties', 'src/**/*.gradle.kts') }}
+          key: ${{ runner.os }}-gradle-modules-${{ hashFiles('src/gradle/libs.versions.toml', 'src/gradle/wrapper/gradle-wrapper.properties', 'src/**/*.gradle.kts') }}-t1
           restore-keys: |
             ${{ runner.os }}-gradle-modules-
 
@@ -1006,6 +1008,90 @@ jobs:
             rm -f "$RUNNER_TEMP/build.log"
           fi
 
+      # PUB-496 (PUB-488: nativeruntime-dist-compat 429 in the tests job): the APK build resolves only the app's runtime
+      # graph, so before the cache is saved, download (no compile, no test run) the external libraries of every module's
+      # unit-test classpaths into modules-2. The configurations are found in the project, not listed here. 429/5xx: the
+      # same one retry as PUB-333; still failing (or nothing found) -> the cache is not saved, the build stays green.
+      # Gradle output goes to the encrypted testdeps.log; the public log gets fixed words and numbers only.
+      - name: Unit test libraries for the cache (download only)
+        id: testdeps
+        if: steps.depcache.outcome == 'success' && steps.depcache.outputs.cache-hit != 'true' && env.RC == '0'
+        timeout-minutes: 20
+        continue-on-error: true
+        working-directory: src
+        run: |
+          set +e
+          M="$HOME/.gradle/caches/modules-2"
+          LOG="$RUNNER_TEMP/testdeps.log"
+          INIT="$RUNNER_TEMP/june-test-deps.gradle"
+          libs() { find "$M/files-2.1" -mindepth 3 -maxdepth 3 -type d 2>/dev/null | wc -l; }
+          mb() { du -sm "$M" 2>/dev/null | cut -f1; }
+          L0=$(libs); MB0=$(mb)
+          cat > "$INIT" <<'GRADLE'
+          // PUB-496: one task per project; it resolves only its own unit-test classpaths (external modules, lenient)
+          import java.util.regex.Pattern
+          import org.gradle.api.artifacts.component.ModuleComponentIdentifier
+
+          def wanted = Pattern.compile('^((gplayD|d)ebugUnitTest|test)(Compile|Runtime)Classpath$')
+          def network = Pattern.compile('(?i)(status code (429|5[0-9][0-9])|could not (get|head) |connection|timed out|unknown ?host|ssl)')
+          gradle.allprojects { p ->
+              def confs = p.configurations
+              def where = p.path
+              p.tasks.register("juneUnitTestDeps") {
+                  doLast {
+                      int n = 0, files = 0, net = 0, other = 0
+                      confs.matching { it.canBeResolved && wanted.matcher(it.name).matches() }.each { c ->
+                          n++
+                          def arts = c.incoming.artifactView {
+                              lenient(true)
+                              componentFilter { it instanceof ModuleComponentIdentifier }
+                          }.artifacts
+                          files += arts.artifacts.size()
+                          arts.failures.each { f ->
+                              def parts = []
+                              for (Throwable e = f; e != null; e = e.cause) parts << String.valueOf(e.message)
+                              def text = parts.join(" > ")
+                              if (network.matcher(text).find()) net++ else other++
+                              logger.lifecycle("june-test-deps failure ${where} ${c.name}: ${text}")
+                          }
+                      }
+                      logger.lifecycle("june-test-deps: configurations ${n}  files ${files}  network ${net}  other ${other}")
+                      if (net > 0) throw new GradleException("june-test-deps: ${net} download failures in ${where}")
+                  }
+              }
+          }
+          GRADLE
+          CMD=(./gradlew -I "$INIT" juneUnitTestDeps --continue --no-configure-on-demand --no-configuration-cache --console=plain)
+          "${CMD[@]}" > "$LOG" 2>&1
+          TDRC=$?
+          # PUB-333 rule (429, here also 5xx): wait 60-120 s, run the same Gradle command once more
+          RETRY429=0
+          if [ "$TDRC" -ne 0 ] && grep -qE 'status code (429|5[0-9][0-9])' "$LOG" 2>/dev/null; then
+            RETRY429=1
+            echo "429 감지, 1회 재시도"
+            WAIT429=${JUNE_BUILD_429_WAIT:-$(( 60 + RANDOM % 61 ))}
+            sleep "$WAIT429"
+            {
+              echo "retry429: 1 (status code 429/5xx, waited ${WAIT429}s, same Gradle command once more)"
+              "${CMD[@]}"
+            } >> "$LOG" 2>&1
+            TDRC=$?
+          fi
+          ./gradlew --stop >/dev/null 2>&1
+          N=$(awk '/^june-test-deps: configurations /{s+=$3} END{print s+0}' "$LOG" 2>/dev/null)
+          N=${N:-0}
+          mkdir -p "$RUNNER_TEMP/out"
+          age -r "$AGE_RECIPIENT" -o "$RUNNER_TEMP/out/testdeps.log.age" "$LOG" >/dev/null 2>&1
+          rm -f "$LOG" "$INIT"
+          if [ "$TDRC" -eq 0 ] && [ "$N" -gt 0 ]; then
+            echo "test deps: ok  configurations $N  new libraries $(( $(libs) - L0 ))  mb ${MB0:-0} -> $(mb)"
+            echo "ok=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "test deps: failed  configurations $N  (dependency cache not saved)"
+            echo "ok=0" >> "$GITHUB_OUTPUT"
+          fi
+          echo "retry429: $RETRY429"
+
       - name: Memory log after build (numbers only)
         if: always() && env.JUNE_BUILD_MEMLOG != '0'
         run: |
@@ -1015,11 +1101,12 @@ jobs:
 
       # PUB-333: saved once, at the end, after "Keep partial build log" removed the keystore; only from a green run
       # that missed the exact key (an existing key is never overwritten). PUB-379: only this job saves (the tests job
-      # only restores), so the two jobs never write the same key; a green APK build has resolved the whole app graph. The check refuses when the keystore is still
+      # only restores), so the two jobs never write the same key; a green APK build has resolved the whole app graph,
+      # and PUB-496's step above added the unit-test libraries (no save when that step failed). The check refuses when the keystore is still
       # there or anything in modules-2 names the app or the private repository; it prints fixed words and numbers only.
       - name: Check dependency cache
         id: depcheck
-        if: steps.depcache.outcome == 'success' && steps.depcache.outputs.cache-hit != 'true' && env.RC == '0'
+        if: steps.depcache.outcome == 'success' && steps.depcache.outputs.cache-hit != 'true' && env.RC == '0' && steps.testdeps.outputs.ok == '1'
         env:
           SRC_REPO: ${{ secrets.SRC_REPO }}
         run: |
